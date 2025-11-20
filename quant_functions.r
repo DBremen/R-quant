@@ -21,7 +21,7 @@ library(scales)
 #'                       (e.g., 2.0, meaning a 2-sigma trade threshold).
 #'
 #' @return The input dataframe augmented with 'effective_buffer' and 'final_weight' columns.
-apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
+mq_apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
   
   # Ensure the data is sorted by date within each ticker group for proper sequential processing
   df_sorted <- df %>%
@@ -80,7 +80,7 @@ apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
 }
 
 
-xts_to_tidy <- function(..., date_col = "date") {
+mq_xts_to_tidy <- function(..., date_col = "date") {
   # Capture all XTS objects passed to the function
   xts_list <- list(...)
 
@@ -126,7 +126,7 @@ xts_to_tidy <- function(..., date_col = "date") {
 
 
 
-get_csv_Yahoo <- function(link) {
+mq_get_csv_Yahoo <- function(link) {
   #link <- 'https://docs.google.com/spreadsheets/d/1_Aa0upRaSAWAtnTuI3lkdNBXZ2dM3GouMiB2w09DFCY/export?format=csv'
   cat(paste("Downloading CSV from:", link, "\n"))
 
@@ -178,7 +178,7 @@ get_csv_Yahoo <- function(link) {
 #'
 #' @param df A dataframe containing at least 'date' and 'ticker' columns.
 #' @return The earliest Date object (or POSIXct) on which all unique tickers are present.
-find_first_full_date <- function(df) {
+mq_find_first_full_date <- function(df) {
   
   # 1. Count the total number of unique tickers in the entire dataset
   n_total_tickers <- df %>% 

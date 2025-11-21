@@ -1025,3 +1025,159 @@ mq_update_price <- function(df, ticker, date, new_price, new_adjusted_price = NU
     rows_confirmed = updated_rows
   ))
 }
+
+#' @title Generate Percentage Stacked Bar Chart for Backtest Exposure
+#'
+#' @description
+#' Calculates the daily percentage exposure of each non-NAV asset relative to
+#' the total absolute daily exposure and generates a stacked bar chart.
+#' This function is essential for visualizing the allocation shifts over time.
+#'
+#' @param df A data frame containing backtest results.
+#'           Must include 'ticker', 'date', and 'exposure' columns.
+#'
+#' @return A ggplot object (a percentage stacked bar chart).
+
+mq_backtest_percentage_exposure <- function(df) {
+
+  # Ensure required packages are available
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
+  if (!requireNamespace("ggplot2", quietly = TRUE)) stop("Package 'ggplot2' is required.")
+  if (!requireNamespace("scales", quietly = TRUE)) stop("Package 'scales' is required.")
+
+  # Check for essential columns
+  required_cols <- c("ticker", "date", "exposure")
+  if (!all(required_cols %in% names(df))) {
+    stop(paste("Data frame must contain the following columns:", paste(required_cols, collapse = ", ")))
+  }
+
+  # --- Data Preparation for Percentage Stacked Bar Chart ---
+
+  exposure_percentage_df <- df %>%
+    dplyr::filter(ticker != "NAV") %>%
+    dplyr::group_by(date) %>%
+    # Calculate total daily absolute exposure (handles long/short positions correctly)
+    dplyr::mutate(total_daily_exposure = sum(abs(exposure), na.rm = TRUE)) %>%
+    dplyr::ungroup() %>%
+    # Calculate proportion: use ifelse to prevent division by zero if total_daily_exposure is 0
+    dplyr::mutate(
+      proportion_exposure = dplyr::if_else(
+        total_daily_exposure == 0,
+        0, # Set proportion to 0 if there is no exposure
+        exposure / total_daily_exposure
+      )
+    ) %>%
+    # Clean up factor levels to ensure 'Cash' (or a common low-priority item) is always at the bottom of the stack
+    dplyr::mutate(
+      ticker = factor(ticker, levels = sort(unique(ticker), decreasing = FALSE))
+    )
+
+
+  # --- Plotting the Percentage Stacked Bar Chart ---
+
+  plot_output <- exposure_percentage_df %>%
+    ggplot2::ggplot(ggplot2::aes(x = date, y = proportion_exposure, fill = ticker)) +
+    ggplot2::geom_bar(stat = "identity", position = "fill") + # Position = "fill" normalizes bars to 100%
+
+    ggplot2::scale_y_continuous(labels = scales::percent) + # Format y-axis as percentage
+    ggplot2::labs(
+      x = "Date",
+      y = "Percentage Exposure",
+      title = "Daily Percentage Exposure by Ticker",
+      caption = "Proportion calculated relative to total absolute daily exposure (sum of |exposure|)."
+    ) +
+    # Add a clean, minimal theme
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      legend.position = "bottom",
+      # Improve X-axis readability for many dates
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1)
+    )
+
+  return(plot_output)
+}
+
+#' Generate a summary table of trade metrics and commission impact per ticker.
+#'
+#' This function calculates the total number of trades, total commissions paid,
+#' and the ratio of total commissions to total dollar returns for each asset (ticker).
+#'
+#' @param results_df The long-format dataframe containing the raw backtest results.
+#'                   Must include columns: 'ticker', 'date', 'exposure', 'share_trades', and 'commission'.
+#'
+#' @return A formatted tibble summarizing the metrics per ticker.
+mq_backtest_ticker_stats <- function(results_df) {
+
+  # --- 0. Data Preparation: Calculate Returns from Exposure ---
+  # Group by ticker and calculate the daily dollar return.
+  data_with_returns <- results_df %>%
+    group_by(ticker) %>%
+    arrange(date) %>%
+    mutate(
+      # Daily Dollar Return: The absolute change in value of the exposure
+      # This is the P&L from the asset's holding
+      `Daily.Dollar.Return` = exposure - dplyr::lag(exposure),
+
+      # Daily Logarithmic Return (as requested in the query, included for completeness)
+      `Daily.Log.Return` = log(exposure / dplyr::lag(exposure))
+    ) %>%
+    ungroup()
+
+  # 1. Calculate Ticker-level Aggregates
+  ticker_metrics <- data_with_returns %>%
+    # Exclude the CASH ticker, which typically doesn't generate trade returns in this context
+    filter(ticker != "CASH") %>%
+    group_by(ticker) %>%
+    summarise(
+      # Total Trades: Count where a trade occurred (shares moved)
+      `Total Trades` = sum(abs(share_trades) > 1e-6, na.rm = TRUE),
+
+      # Total Commissions: Sum of all commissions paid
+      `Total Commissions` = sum(commission, na.rm = TRUE),
+
+      # Total Return: Sum of the daily dollar returns (the cumulative dollar gain/loss)
+      `Total Return` = sum(`Daily.Dollar.Return`, na.rm = TRUE),
+
+      .groups = 'drop'
+    )
+
+  # 2. Calculate the Commission Ratio (Commissions vs. Dollar Return)
+  summary_with_ratio <- ticker_metrics %>%
+    mutate(
+      # Commission / Return Ratio: Total Commissions / Absolute Total Dollar Return
+      # This calculates the commission cost as a percentage of the total P&L magnitude.
+      `Commission / Return Ratio` = ifelse(
+        abs(`Total Return`) > 1e-6, # Avoid division by zero
+        `Total Commissions` / abs(`Total Return`),
+        NA_real_
+      )
+    )
+
+  # 3. Format the output table
+  formatted_output <- summary_with_ratio %>%
+    mutate(
+      # Format monetary and numerical values
+      `Total Commissions` = dollar(`Total Commissions`, accuracy = 0.01),
+      `Total Return` = dollar(`Total Return`, accuracy = 0.01),
+      `Commission / Return Ratio` = percent(`Commission / Return Ratio`, accuracy = 0.01)
+    ) %>%
+    select(
+      Ticker = ticker,
+      `Total Trades`,
+      `Total Commissions`,
+      `Total Return`,
+      `Commission / Return Ratio`
+    )
+
+  # 4. Print the result using kable
+  cat("## Ticker-Specific Trade & Commission Summary\n\n")
+
+  print(knitr::kable(
+    formatted_output,
+    caption = "Summary of Trading Activity and Commission Impact per Asset (Commissions vs. Total Dollar Return)",
+    align = c('l', 'r', 'r', 'r', 'r')
+  ))
+
+  return(formatted_output)
+}

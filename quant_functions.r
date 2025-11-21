@@ -1181,3 +1181,752 @@ mq_backtest_ticker_stats <- function(results_df) {
 
   return(formatted_output)
 }
+
+
+#' @title Generate Comprehensive Backtest Summary Statistics
+#'
+#' @description
+#' Calculates daily Net Asset Value (NAV) and returns from backtest exposure data,
+#' and then uses the 'PerformanceAnalytics' package to generate common trading
+#' statistics like Annualized Return, Volatility, Sharpe Ratio, and Max Drawdown.
+#'
+#' @param df A data frame containing backtest results.
+#'           Must include 'ticker', 'date' (as Date type), and 'exposure' columns.
+#'
+#' @return A data frame containing key performance metrics.
+#'
+#' @importFrom dplyr group_by summarise mutate filter select arrange lag bind_rows pull rename bind_cols
+#' @importFrom tibble as_tibble rownames_to_column
+#' @importFrom xts xts
+#' @importFrom PerformanceAnalytics table.AnnualizedReturns table.Drawdowns table.Stats VaR CalmarRatio
+#' @importFrom tidyr drop_na pivot_wider
+#'
+mq_backtest_summarystats <- function(df) {
+
+  # --- 1. Package and Column Validation ---
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
+  if (!requireNamespace("xts", quietly = TRUE)) stop("Package 'xts' is required.")
+  if (!requireNamespace("PerformanceAnalytics", quietly = TRUE)) stop("Package 'PerformanceAnalytics' is required.")
+  if (!requireNamespace("tidyr", quietly = TRUE)) stop("Package 'tidyr' is required.")
+  if (!requireNamespace("scales", quietly = TRUE)) stop("Package 'scales' is required.")
+
+  required_cols <- c("ticker", "date", "exposure")
+  if (!all(required_cols %in% names(df))) {
+    stop(paste("Data frame must contain the following columns:", paste(required_cols, collapse = ", ")))
+  }
+
+  # --- 2. Calculate Daily Net Asset Value (NAV) ---
+
+  nav_data <- df %>%
+    dplyr::group_by(date) %>%
+    dplyr::summarise(NAV = sum(exposure, na.rm = TRUE)) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(date)
+
+  if(nrow(nav_data) < 2) {
+    warning("Not enough data points (need at least 2 days) to calculate returns.")
+    return(data.frame())
+  }
+  if(any(nav_data$NAV <= 0)) {
+     warning("NAV must be strictly positive for return calculation. Check for days with zero or negative total exposure.")
+  }
+
+  # --- 3. Calculate Simple Daily Returns ---
+
+  daily_returns_df <- nav_data %>%
+    dplyr::mutate(
+      returns = (NAV / dplyr::lag(NAV)) - 1
+    ) %>%
+    tidyr::drop_na(returns)
+
+  # --- 4. Prepare Data for PerformanceAnalytics (xts object) ---
+
+  returns_xts <- xts::xts(daily_returns_df$returns, order.by = daily_returns_df$date)
+  colnames(returns_xts) <- "Strategy"
+
+  # --- 5. Calculate Key Statistics using PerformanceAnalytics ---
+  
+  # Check if there are enough unique non-zero returns for some stats to be meaningful
+  if(length(returns_xts) < 20) {
+      warning("Fewer than 20 daily returns found. Performance metrics may be unreliable.")
+  }
+
+  # A. Annualized Performance Metrics (Return, Volatility, Sharpe)
+  annualized_stats <- PerformanceAnalytics::table.AnnualizedReturns(
+    returns_xts,
+    Rf = 0,
+    scale = 252,
+    geometric = TRUE
+  )
+
+  # B. Descriptive Stats (Skewness, Kurtosis)
+  core_stats <- PerformanceAnalytics::table.Stats(returns_xts, digits = 4)
+
+  # C. Value-at-Risk (Modified) and Calmar Ratio
+  modified_var <- PerformanceAnalytics::VaR(
+      R = returns_xts,
+      p = 0.95, # 5% probability
+      method = "modified"
+  )
+  calmar <- PerformanceAnalytics::CalmarRatio(returns_xts)
+
+  # D. Max Drawdown (numeric value extracted explicitly and converted to simple numeric)
+  max_drawdown_value <- PerformanceAnalytics::table.Drawdowns(returns_xts) %>%
+    as.data.frame() %>%
+    dplyr::slice(1) %>%
+    dplyr::pull(Depth) %>%
+    as.numeric()
+
+
+  # --- 6. Consolidate and Format Results ---
+
+  # A. Transpose and standardise the annual stats column names
+  annual_df_raw <- annualized_stats %>%
+    tibble::rownames_to_column("Metric") %>%
+    tidyr::pivot_wider(names_from = Metric, values_from = Strategy) %>%
+    # Select the first three columns, which are always the Annualized Metrics
+    dplyr::select(1:3)
+
+  # Set the names directly, ignoring the coerced names R produced
+  names(annual_df_raw) <- c("Annualized_Return_Raw", "Annualized_Std_Dev_Raw", "Sharpe_Ratio_Raw")
+
+
+  # B. Prepare descriptive stats and standardize column names
+  descriptive_df <- core_stats %>%
+    tibble::rownames_to_column("Metric") %>%
+    tidyr::pivot_wider(names_from = Metric, values_from = Strategy)
+
+  # Combine descriptive stats and Calmar/VaR results
+  final_descriptive <- descriptive_df %>%
+    dplyr::select(Skewness, Kurtosis) %>%
+    dplyr::mutate(
+      # FIX: Use safer numeric extraction for Calmar and VaR
+      Value_at_Risk_Raw = as.numeric(modified_var)[1],
+      Calmar_Ratio_Raw = as.numeric(calmar)[1]
+    )
+
+  # C. Combine all raw data using bind_cols for safety
+  raw_stats <- dplyr::bind_cols(annual_df_raw, final_descriptive)
+
+  # D. Perform calculations using safe names and create final display columns
+  final_stats <- raw_stats %>%
+    dplyr::mutate(
+      # Temporary column for drawdown calculation: use absolute value of depth for standard reporting
+      Max_Drawdown_Value = abs(max_drawdown_value),
+
+      # Perform rounding/formatting on raw values and assign to final display names
+      `Annualized Return` = scales::percent(Annualized_Return_Raw, accuracy = 0.01),
+      `Annual Volatility` = scales::percent(Annualized_Std_Dev_Raw, accuracy = 0.01),
+      `Max Drawdown` = scales::percent(Max_Drawdown_Value, accuracy = 0.01),
+      
+      # Use the safe raw column name for rounding
+      `Sharpe Ratio` = round(Sharpe_Ratio_Raw, 4), 
+      
+      `Calmar Ratio` = round(Calmar_Ratio_Raw, 4),
+      `Value-at-Risk (5%)` = scales::percent(Value_at_Risk_Raw, accuracy = 0.01)
+    ) %>%
+    # Select and reorder the final display columns, dropping all raw/temporary columns
+    dplyr::select(
+      `Annualized Return`,
+      `Annual Volatility`,
+      `Sharpe Ratio`,
+      `Max Drawdown`,
+      `Calmar Ratio`,
+      `Value-at-Risk (5%)`,
+      Skewness,
+      Kurtosis
+    )
+
+  return(final_stats)
+}
+
+#' @title Plot Rolling 60-day Annualized Portfolio Volatility
+#'
+#' @description
+#' Calculates the daily Net Asset Value (NAV), derives log returns, and then
+#' computes the rolling 60-day annualized volatility. It returns a ggplot object
+#' visualizing the volatility over time.
+#'
+#' @param df A data frame containing backtest results.
+#'           Must include 'date' (as Date type) and 'exposure' columns.
+#'
+#' @return A ggplot object showing the rolling annualized volatility.
+#'
+#' @importFrom dplyr group_by summarise ungroup arrange mutate lag
+#' @importFrom tidyr drop_na
+#' @importFrom roll roll_sd
+#' @importFrom ggplot2 ggplot aes geom_line labs
+#'
+mq_backtest_rolling_portfolioVol <- function(df) {
+
+  # --- 1. Validation and Setup ---
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
+  if (!requireNamespace("tidyr", quietly = TRUE)) stop("Package 'tidyr' is required.")
+  if (!requireNamespace("roll", quietly = TRUE)) stop("Package 'roll' is required (install with install.packages('roll')).")
+  if (!requireNamespace("ggplot2", quietly = TRUE)) stop("Package 'ggplot2' is required.")
+
+  required_cols <- c("date", "exposure")
+  if (!all(required_cols %in% names(df))) {
+    stop(paste("Data frame must contain the following columns:", paste(required_cols, collapse = ", ")))
+  }
+
+  # --- 2. Calculate Daily Net Asset Value (NAV) ---
+
+  # Group by date and sum 'exposure' to get the total portfolio value (NAV)
+  nav_data <- df %>%
+    dplyr::group_by(date) %>%
+    dplyr::summarise(NAV = sum(exposure, na.rm = TRUE)) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(date)
+
+  if (nrow(nav_data) < 60) {
+    stop("Not enough data points (need at least 60 days) to calculate rolling volatility.")
+  }
+  
+  # --- 3. Calculate Log Returns and Rolling Volatility ---
+
+  # Calculate log returns: log(NAV_t / NAV_{t-1})
+  # Calculate rolling 60-day standard deviation, then annualize (sqrt(252))
+  port_vol_data <- nav_data %>%
+    dplyr::mutate(
+      returns = log(NAV / dplyr::lag(NAV))
+    ) %>%
+    # Use 60-day window for rolling standard deviation
+    dplyr::mutate(
+      `Rolling Ann.Volatility` = sqrt(252) * roll::roll_sd(returns, width = 60, min_obs = 60)
+    ) %>%
+    # Remove NAs resulting from lag() and the initial 59 days of the rolling calculation
+    tidyr::drop_na(`Rolling Ann.Volatility`)
+
+
+  # --- 4. Generate Plot ---
+
+  portfolio_vol_plot <- port_vol_data %>%
+    ggplot2::ggplot(ggplot2::aes(x = date, y = `Rolling Ann.Volatility`)) +
+    ggplot2::geom_line(color = "#1f77b4", linewidth = 1) +
+    ggplot2::labs(
+      title = "Rolling 60-day Annualized Portfolio Volatility",
+      x = "Date",
+      y = "Annualized Volatility (Std. Dev.)"
+    ) +
+    # Enhance the theme for better visualization
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+        axis.title.y = ggplot2::element_text(margin = ggplot2::margin(r = 10)),
+        axis.title.x = ggplot2::element_text(margin = ggplot2::margin(t = 10)),
+        panel.grid.minor = ggplot2::element_blank()
+    ) +
+    # Format Y-axis as percentages for clarity
+    ggplot2::scale_y_continuous(labels = scales::percent)
+
+  return(portfolio_vol_plot)
+}
+
+#' @title Plot Comprehensive Rolling Portfolio Performance Metrics
+#'
+#' @description
+#' Calculates and visualizes key performance metrics for a backtest, including
+#' cumulative return, drawdown, rolling 12-month return, volatility, Sharpe Ratio,
+#' and monthly total returns.
+#'
+#' @param df A data frame containing backtest results.
+#'           Must include 'date' (as Date type) and 'exposure' columns.
+#'
+#' @return A ggplot object showing a multi-panel analysis of portfolio performance.
+#'
+#' @importFrom dplyr group_by summarise ungroup arrange mutate select bind_rows
+#' @importFrom tidyr drop_na pivot_longer
+#' @importFrom roll roll_mean roll_sd
+#' @importFrom ggplot2 ggplot aes geom_line labs theme_minimal theme element_text element_blank geom_hline geom_bar scale_fill_manual facet_wrap ggsave
+#' @importFrom scales label_percent
+#' @importFrom stats na.omit
+#'
+mq_backtest_rolling_portfolioPerformance <- function(df) {
+
+  # --- 0. Setup and Validation ---
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
+  if (!requireNamespace("tidyr", quietly = TRUE)) stop("Package 'tidyr' is required.")
+  if (!requireNamespace("roll", quietly = TRUE)) stop("Package 'roll' is required.")
+  if (!requireNamespace("ggplot2", quietly = TRUE)) stop("Package 'ggplot2' is required.")
+  if (!requireNamespace("scales", quietly = TRUE)) stop("Package 'scales' is required.")
+
+  required_cols <- c("date", "exposure")
+  if (!all(required_cols %in% names(df))) {
+    stop(paste("Data frame must contain the following columns:", paste(required_cols, collapse = ", ")))
+  }
+
+  # Define constants
+  ROLLING_WINDOW <- 252 # 252 trading days = approx. 1 year
+  RISK_FREE_RATE <- 0   # Risk-free rate (assumed to be zero for simplicity)
+
+  # --- 1. Calculate Daily Net Asset Value (NAV) ---
+
+  daily_nav_data <- df %>%
+    dplyr::group_by(date) %>%
+    # Sum daily exposures across all holdings to get the total portfolio value (NAV)
+    dplyr::summarise(NAV = sum(exposure, na.rm = TRUE)) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(date)
+
+  if (nrow(daily_nav_data) < ROLLING_WINDOW) {
+    stop(paste("Insufficient data. Requires at least", ROLLING_WINDOW, "days for 12-month rolling metrics."))
+  }
+
+  # --- 2. Calculate Daily Performance Metrics (Simple Returns, Drawdown, Rolling Metrics) ---
+
+  daily_performance <- daily_nav_data %>%
+    dplyr::arrange(date) %>%
+    # Calculate Daily Simple Returns
+    dplyr::mutate(Daily.Return = (NAV / dplyr::lag(NAV)) - 1) %>%
+    stats::na.omit() %>%
+
+    # Calculate Cumulative Return
+    dplyr::mutate(`Cumulative Return` = cumprod(1 + Daily.Return) - 1) %>%
+
+    # Calculate Drawdown
+    dplyr::mutate(
+      Peak.NAV = cummax(NAV),
+      `Drawdown` = (NAV / Peak.NAV) - 1 # Drawdown is a ratio (negative number)
+    ) %>%
+
+    # Calculate Rolling Metrics (12-month / 252-day window)
+    dplyr::mutate(
+      # Rolling Annualized Return
+      `Rolling.Ann.Return` = 252 * as.vector(roll::roll_mean(Daily.Return, width = ROLLING_WINDOW, min_obs = ROLLING_WINDOW)),
+      # Rolling Annualized Volatility
+      `Rolling.Ann.Volatility` = sqrt(252) * as.vector(roll::roll_sd(Daily.Return, width = ROLLING_WINDOW, min_obs = ROLLING_WINDOW)),
+      # Rolling Annualized Sharpe Ratio (using RF=0)
+      `Rolling.Ann.Sharpe` = `Rolling.Ann.Return` / `Rolling.Ann.Volatility`
+    ) %>%
+    stats::na.omit() # Remove NAs from the rolling calculation start
+
+
+  # --- 3. MONTHLY TOTAL RETURN CALCULATION (For Bar Chart) ---
+
+  monthly_returns <- daily_performance %>%
+    dplyr::group_by(year_month = format(date, "%Y-%m")) %>%
+    dplyr::summarise(
+      # Calculate compound monthly return
+      Value = (prod(1 + Daily.Return) - 1),
+      date = min(date),
+      Metric = "Monthly.Total.Return" # Raw metric name
+    ) %>%
+    dplyr::ungroup()
+
+
+  # --- 4. PREPARE DATA FOR VISUALIZATION (TIDY FORMAT) ---
+
+  # Tidy the daily data for line plots (Cumulative and Rolling Metrics)
+  line_plot_data <- daily_performance %>%
+    dplyr::select(date, `Cumulative Return`, `Drawdown`, `Rolling.Ann.Return`, `Rolling.Ann.Volatility`, `Rolling.Ann.Sharpe`) %>%
+    tidyr::pivot_longer(
+      cols = -date,
+      names_to = "Metric",
+      values_to = "Value"
+    )
+
+  # Combine line and bar chart data into a single object for plotting
+  combined_data <- dplyr::bind_rows(line_plot_data, monthly_returns)
+
+  # Define the order and labels for the facets
+  metric_labels <- c(
+    "Monthly.Total.Return" = "Monthly Total Return",
+    "Cumulative Return" = "Cumulative Return",
+    "Drawdown" = "Drawdown (Max Loss)",
+    "Rolling.Ann.Return" = "12M Rolling Annualized Return",
+    "Rolling.Ann.Volatility" = "12M Rolling Annualized Volatility",
+    "Rolling.Ann.Sharpe" = "12M Rolling Annualized Sharpe Ratio (RF=0)"
+  )
+  metric_order <- names(metric_labels)
+
+  # --- 5. GENERATE COMBINED PERFORMANCE PLOT ---
+
+  performance_plot <- ggplot2::ggplot(combined_data, ggplot2::aes(x = date, y = Value)) +
+
+    # Add Bar Chart for Monthly Returns
+    ggplot2::geom_bar(
+      data = combined_data %>% dplyr::filter(Metric == "Monthly.Total.Return"),
+      stat = "identity",
+      ggplot2::aes(fill = Value > 0),
+      width = 25
+    ) +
+    ggplot2::scale_fill_manual(values = c("TRUE" = "#10b981", "FALSE" = "#ef4444"), guide = "none") +
+
+    # Add Line Plots for Cumulative, Drawdown, and Rolling Metrics
+    ggplot2::geom_line(
+      data = combined_data %>% dplyr::filter(Metric != "Monthly.Total.Return"),
+      ggplot2::aes(group = Metric),
+      color = "#3b82f6",
+      linewidth = 0.8
+    ) +
+
+    # Add Zero Horizontal Line for Reference on ALL panels
+    ggplot2::geom_hline(yintercept = 0, color = "gray50", linetype = "dashed", linewidth = 0.5) +
+
+    # Apply Faceting and Theming
+    ggplot2::facet_wrap(~factor(Metric, levels = metric_order, labels = metric_labels),
+              scales = "free_y", ncol = 1, strip.position = "right") +
+
+    # Apply scales::percent globally to format ratios (returns, drawdown, volatility)
+    ggplot2::scale_y_continuous(labels = scales::label_percent(accuracy = 0.1)) +
+    ggplot2::scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+
+    ggplot2::labs(
+      title = "Time-Series Performance Analysis of Portfolio (12-Month Rolling)",
+      x = NULL,
+      y = "Value"
+    ) +
+
+    ggplot2::theme_minimal(base_size = 14) +
+    ggplot2::theme(
+      strip.text.y.right = ggplot2::element_text(angle = 0, face = "bold"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      panel.grid.minor = ggplot2::element_blank(),
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5),
+      panel.spacing = ggplot2::unit(1, "lines")
+    )
+
+  # Return the plot object
+  return(performance_plot)
+}
+
+#' @title Calculate and Display Annual Portfolio Performance Metrics
+#'
+#' @description
+#' Calculates key annual performance metrics including Annual Return,
+#' Annual Volatility, Max Drawdown, and Annual Sharpe Ratio, and displays
+#' them in a formatted table.
+#'
+#' @param df A data frame containing backtest results.
+#'           Must include 'date' (as Date type) and 'exposure' columns.
+#'
+#' @return Prints a kable table of annual performance metrics to the console.
+#'         Returns the underlying data frame invisibly.
+#'
+#' @importFrom dplyr group_by summarise ungroup arrange mutate select
+#' @importFrom tidyr drop_na
+#' @importFrom scales percent
+#' @importFrom stats sd na.omit
+#' @importFrom knitr kable
+#'
+mq_backtest_annual_performance <- function(df) {
+
+  # --- 0. Setup and Validation ---
+  if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
+  if (!requireNamespace("tidyr", quietly = TRUE)) stop("Package 'tidyr' is required.")
+  if (!requireNamespace("scales", quietly = TRUE)) stop("Package 'scales' is required.")
+  if (!requireNamespace("knitr", quietly = TRUE)) stop("Package 'knitr' is required.")
+
+  required_cols <- c("date", "exposure")
+  if (!all(required_cols %in% names(df))) {
+    stop(paste("Data frame must contain the following columns:", paste(required_cols, collapse = ", ")))
+  }
+
+  # Define constants
+  TRADING_DAYS_PER_YEAR <- 252
+  RISK_FREE_RATE <- 0 # Risk-free rate (assumed to be zero for simplicity)
+
+  # --- 1. Calculate Daily Net Asset Value (NAV) ---
+
+  daily_nav_data <- df %>%
+    dplyr::group_by(date) %>%
+    # Sum daily exposures across all holdings to get the total portfolio value (NAV)
+    dplyr::summarise(NAV = sum(exposure, na.rm = TRUE)) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(date)
+
+  # --- 2. Calculate Daily Returns and Drawdown ---
+
+  daily_performance <- daily_nav_data %>%
+    dplyr::arrange(date) %>%
+    # Calculate Daily Simple Returns: (NAV_t / NAV_{t-1}) - 1
+    dplyr::mutate(Daily.Return = (NAV / dplyr::lag(NAV)) - 1) %>%
+    stats::na.omit() %>%
+
+    # Calculate Cumulative Drawdown
+    dplyr::mutate(
+      Peak.NAV = cummax(NAV),
+      `Drawdown` = (NAV / Peak.NAV) - 1
+    ) %>%
+    # Add Year column for grouping
+    dplyr::mutate(Year = format(date, "%Y"))
+
+
+  # --- 3. ANNUAL PERFORMANCE METRICS CALCULATION (AGGREGATION) ---
+
+  annual_summary <- daily_performance %>%
+    dplyr::group_by(Year) %>%
+    dplyr::summarise(
+      # Annual Geometric Return (Product of 1 + daily returns - 1)
+      `Annual.Return` = prod(1 + Daily.Return) - 1,
+
+      # Annualized Volatility (SD of daily returns * sqrt(252))
+      `Annual.Volatility` = sd(Daily.Return, na.rm = TRUE) * sqrt(TRADING_DAYS_PER_YEAR),
+
+      # Max Drawdown (Minimum drawdown observed within the current year's data)
+      # This finds the largest *intrayear* drawdown magnitude.
+      `Max.Drawdown` = min(Drawdown),
+
+      # Simple Annual Sharpe Ratio (Annual Return / Annual Volatility)
+      `Annual.Sharpe` = `Annual.Return` / `Annual.Volatility`,
+
+      .groups = 'drop'
+    )
+
+
+  # --- 4. FORMATTING AND OUTPUT ---
+
+  # Define formatting functions
+  format_percent <- function(x) {
+    # Format percentages to one decimal place
+    scales::percent(x, accuracy = 0.1)
+  }
+
+  format_sharpe <- function(x) {
+    # Format Sharpe Ratio to two decimal places
+    format(round(x, 2), nsmall = 2)
+  }
+
+  # Apply formatting
+  formatted_summary <- annual_summary %>%
+    dplyr::mutate(
+      `Annual Return` = format_percent(`Annual.Return`),
+      `Annual Volatility` = format_percent(`Annual.Volatility`),
+      # Max Drawdown is negative, but we display the magnitude (positive)
+      `Max Drawdown` = format_percent(abs(`Max.Drawdown`)),
+      `Annual Sharpe Ratio` = format_sharpe(`Annual.Sharpe`)
+    ) %>%
+    # Select final columns in desired order
+    dplyr::select(
+      Year,
+      `Annual Return`,
+      `Annual Volatility`,
+      `Max Drawdown`,
+      `Annual Sharpe Ratio`
+    )
+
+  # Print the formatted table using kable for a clean markdown output
+  cat("## Annual Performance Summary Table\n\n")
+  print(knitr::kable(formatted_summary,
+                      caption = "Key Performance Metrics Aggregated by Calendar Year",
+                      align = c('l', 'r', 'r', 'r', 'r')))
+
+  # Return the underlying data frame invisibly for chaining
+  return(invisible(formatted_summary))
+}
+
+#' @title Generate a Detailed Daily Trade Log
+#'
+#' @description
+#' Creates a wide-format trade log detailing previous day's exposures and
+#' current day's trade actions (shares traded, new exposure, closing price)
+#' for all dates where a transaction occurred.
+#'
+#' @param df A data frame containing detailed backtest results.
+#'           Must include 'date', 'ticker', 'share_trades', 'exposure', and 'close' columns.
+#'
+#' @return A data frame containing the wide-format trade log, sorted by date.
+#'
+#' @importFrom dplyr filter pull unique group_by mutate ungroup select lag left_join arrange
+#' @importFrom tidyr pivot_wider
+#' @importFrom stats na.omit
+#'
+mq_backtest_tradelog <- function(df) {
+
+  # Use a consistent internal name for clarity
+  results_df_buffer_weights <- df
+
+  # --- 1. IDENTIFY TRADE DATES ---
+  # Determine all unique dates where at least one ticker had non-zero share trades
+  trade_dates <- results_df_buffer_weights %>%
+    dplyr::filter(share_trades != 0) %>%
+    dplyr::pull(date) %>%
+    unique()
+
+  if (length(trade_dates) == 0) {
+    message("No trades found in the input data. Returning empty trade log.")
+    return(data.frame())
+  }
+
+
+  # --- 2. PREPARE PREVIOUS DAY'S EXPOSURES (PDE) ---
+
+  prev_exposure_wide <- results_df_buffer_weights %>%
+    # Group by ticker to perform lag function correctly within each ticker series
+    dplyr::group_by(ticker) %>%
+    # Lag the exposure to get the value from the previous day's closing
+    dplyr::mutate(prev_exposure = dplyr::lag(exposure)) %>%
+    dplyr::ungroup() %>%
+
+    # Filter to only keep rows corresponding to the identified trade dates
+    dplyr::filter(date %in% trade_dates) %>%
+
+    # Select the required columns for the first join target
+    dplyr::select(date, ticker, prev_exposure) %>%
+
+    # Pivot wider to create columns like prev_TICKER_exposure
+    tidyr::pivot_wider(
+      names_from = ticker,
+      values_from = prev_exposure,
+      names_prefix = "prev_",
+      names_sep = "_exposure"
+    )
+
+  # --- 3. PREPARE CURRENT DAY'S TRADE DETAILS (CDT) ---
+
+  current_trades_wide <- results_df_buffer_weights %>%
+    # Filter only on trade dates
+    dplyr::filter(date %in% trade_dates & share_trades != 0) %>%
+
+    # Select trade details
+    dplyr::select(date, ticker, share_trades, exposure, close) %>%
+
+    # Convert to wide format. Names will be in the format: TICKER_metric (e.g., AAPL_share_trades)
+    tidyr::pivot_wider(
+      names_from = ticker,
+      values_from = c(share_trades, exposure, close),
+      names_glue = "{ticker}_{.value}"
+    ) %>%
+    # Ensure the date column remains first
+    dplyr::arrange(date)
+
+  # --- 4. COMBINE DATA ---
+
+  # Left join the previous day's exposure data with the current day's trade details on the date column
+  final_trade_log <- dplyr::left_join(prev_exposure_wide, current_trades_wide, by = "date") %>%
+    # Sort final output by date
+    dplyr::arrange(date)
+
+  # --- 5. OUTPUT ---
+  return(final_trade_log)
+}
+
+# --- DETAILED TRADE SUMMARY PRINT FUNCTION ---
+
+#' Prints a formatted, human-readable summary of trades for each day in the log.
+#'
+#' This function iterates through each row of the wide-format trade log,
+#' reporting the previous cash balance and itemizing all buy/sell transactions
+#' for that specific trade date, including the resulting balances.
+#'
+#' @param trade_log_df The wide-format dataframe containing the combined trade data.
+#'                     It must contain 'date', and columns for each traded ticker
+#'                     named like 'TICKER_share_trades', 'TICKER_close', and
+#'                     'prev_TICKER'. The 'prev_Cash' column is
+#'                     optional but recommended for full output.
+mq_backtest_tradeSummary <- function(trade_log_df) {
+  # Dynamically determine which columns represent share trades
+  trade_cols <- names(trade_log_df)[grepl("_share_trades$", names(trade_log_df))]
+  # Extract Tickers that had a trade column (e.g., SXR8.DE, SXRC.MU, EWG2.SG)
+  tickers <- gsub("_share_trades", "", trade_cols)
+
+  cat("## Detailed Trade Summary Log\n")
+
+  # Check for the user-specified cash column name: "prev_Cash"
+  cash_exposure_exists <- "prev_Cash" %in% names(trade_log_df)
+
+  # Loop through each row (trade date) in the log dataframe
+  for (i in 1:nrow(trade_log_df)) {
+    row <- trade_log_df[i, ]
+
+    # Safely convert to character date string
+    date_str <- tryCatch(
+      as.character(row$date),
+      error = function(e) paste("Row", i, "Date Error")
+    )
+
+    # 1. Extract Previous Cash Balance (Robust Check)
+    prev_cash_text <- "N/A (Cash Exposure Missing in Log)"
+    prev_cash_numeric <- NA_real_ # Use NA_real_ for numerical initialization
+
+    if (cash_exposure_exists) {
+      prev_cash_numeric <- as.numeric(row[["prev_Cash"]])
+
+      if (is.na(prev_cash_numeric)) {
+        prev_cash_text <- "N/A (Start of Log)"
+      } else {
+        prev_cash_text <- sprintf("$%.2f", prev_cash_numeric)
+      }
+    }
+
+    # Initialize the current cash balance for iterative updates throughout the trade day
+    current_cash_balance <- prev_cash_numeric
+
+    cat(sprintf("\n--- Trade Date: %s ---\n", date_str))
+    cat(sprintf("Previous Cash: %s\n", prev_cash_text))
+
+    traded_on_date <- FALSE
+
+    # 2. Iterate through each ticker to find trades
+    for (ticker in tickers) {
+      # Column names for the current ticker trade details
+      shares_col <- paste0(ticker, "_share_trades")
+      close_col <- paste0(ticker, "_close")
+      prev_exp_col <- paste0("prev_", ticker)
+
+      # NEW: Column for the current (new) exposure after the trade
+      current_exp_col <- paste0(ticker, "_exposure")
+
+      # Defensive check: ensure all required trade columns exist in the log
+      if (shares_col %in% names(row) && close_col %in% names(row) &&
+          prev_exp_col %in% names(row) && current_exp_col %in% names(row)) {
+
+        # Explicitly ensure shares is treated as a numeric scalar
+        shares <- as.numeric(row[[shares_col]])
+        close <- as.numeric(row[[close_col]])
+        prev_exp <- as.numeric(row[[prev_exp_col]])
+        # Retrieve the new exposure after the trade
+        current_exp <- as.numeric(row[[current_exp_col]])
+
+        # Check if the ticker traded on this date (shares is not NA and not 0)
+        # Using a small tolerance (1e-6) for floating point zero check
+        if (!is.na(shares) && abs(shares) > 1e-6) {
+          traded_on_date <- TRUE
+
+          # Determine action (BUY or SELL)
+          action <- ifelse(shares > 0, "BUY", "SELL")
+          abs_shares <- abs(shares)
+          trade_value <- shares * close # Signed value (positive for BUY, negative for SELL)
+
+          # --- NEW CASH CALCULATION ---
+          # The trade value is deducted from cash for a BUY (trade_value > 0)
+          # and added to cash for a SELL (trade_value < 0), so we subtract the signed value.
+          if (!is.na(current_cash_balance)) {
+             current_cash_balance <- current_cash_balance - trade_value
+          }
+          # ----------------------------
+
+          # 3. Output the formatted trade entry
+          cat(sprintf(
+            "ACTION: %s %d shares of %s at $%.4f for a net value of $%.2f (Previous %s Exposure: $%.2f)\n",
+            toupper(action),
+            abs_shares,
+            ticker,
+            close,
+            trade_value,
+            ticker,
+            prev_exp
+          ))
+
+          # 4. Output the resulting balances
+          if (!is.na(current_cash_balance)) {
+            cat(sprintf(
+              "   --> New %s Exposure: $%.2f | New Cash Balance: $%.2f\n",
+              ticker,
+              current_exp,
+              current_cash_balance
+            ))
+          } else {
+            cat(sprintf(
+              "   --> New %s Exposure: $%.2f | New Cash Balance: N/A (Previous Cash Missing)\n",
+              ticker,
+              current_exp
+            ))
+          }
+        }
+      }
+    }
+  }
+}
+

@@ -20,7 +20,7 @@ library(scales)
 #' @param vol_multiplier The factor by which volatility is multiplied to define the buffer width 
 #'                       (e.g., 2.0, meaning a 2-sigma trade threshold).
 #'
-#' @return The input dataframe augmented with 'effective_buffer' and 'final_weight' columns.
+#' @return The input dataframe augmented with 'effective_buffer' and 'weight_buffer_vol' columns.
 mq_apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
   
   # Ensure the data is sorted by date within each ticker group for proper sequential processing
@@ -33,7 +33,7 @@ mq_apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
     )
   
   # Initialize the final_weight column (will be filled sequentially)
-  df_sorted$final_weight <- NA_real_
+  df_sorted$weight_buffer_vol <- NA_real_
   
   # Use group_split and group_modify to process each ticker's series independently
   df_output <- df_sorted %>%
@@ -50,7 +50,7 @@ mq_apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
         
         # 1. First Day Logic (Always transacts)
         if (is.na(last_transacted_weight)) {
-          .x$final_weight[i] <- current_weight
+          .x$weight_buffer_vol[i] <- current_weight
           last_transacted_weight <- current_weight
           
         } else {
@@ -63,12 +63,12 @@ mq_apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
           
           if (is_outside_buffer) {
             # Transaction occurs
-            .x$final_weight[i] <- current_weight
+            .x$weight_buffer_vol[i] <- current_weight
             last_transacted_weight <- current_weight
             
           } else {
             # No transaction
-            .x$final_weight[i] <- last_transacted_weight
+            .x$weight_buffer_vol[i] <- last_transacted_weight
           }
         }
       }
@@ -496,4 +496,157 @@ mq_get_stock_bond_outperformance <- function(tdm_returns, cutoff_tdm = 14, stock
     select(year, month, equity_outperformance)
   
   return(flow_df)
+}
+
+#' Plots Strategy Cumulative Returns and Rolling Volatility
+#'
+#' Takes a data frame containing daily positions and log returns, calculates
+#' the strategy return, rolling volatility, and cumulative returns, then
+#' generates a combined plot of performance and risk.
+#'
+#' @param flow_positions A data frame containing at least 'date', 'position',
+#'                       and 'log_return' columns, where 'position' is the
+#'                       weight allocated to the asset and 'log_return' is the
+#'                       asset's log return for that day.
+#' @param window The rolling window size for volatility calculation (default: 60 days).
+#' @param annual_factor The annualization factor for volatility (default: 252 trading days).
+#' @return A combined plot object (patchwork class) showing cumulative returns
+#'         and annualized rolling volatility.
+mq_plot_return_vol <- function(flow_positions, window = 60, annual_factor = 252) {
+  
+  # Ensure the necessary package is available for the core calculation
+  if (!requireNamespace("roll", quietly = TRUE)) {
+    stop("The 'roll' package is required for rolling standard deviation calculation. Please install it with install.packages('roll').")
+  }
+  
+  # 1. Calculate Strategy Returns and Rolling Volatility
+  flow_strategy <- flow_positions %>%
+    # Ensure date is properly grouped for daily strategy return calculation
+    group_by(date) %>%
+    # Calculate daily strategy log return: sum(position * asset_log_return)
+    summarise(strat_ret = sum(position * log_return, na.rm = TRUE), .groups = "drop") %>%
+    
+    # Calculate rolling volatility: SD over 'window' days, then annualized
+    mutate(
+      # FIX: Changed 'n = window' to 'width = window' to match the roll::roll_sd argument name.
+      volatility = roll::roll_sd(strat_ret, width = window) * sqrt(annual_factor)
+    )
+
+  # 2. Prepare Data and Create Cumulative Return Plot
+  return_plot <- flow_strategy %>%
+    mutate(cum_ret = cumsum(strat_ret)) %>%
+    ggplot(aes(x = date, y = cum_ret)) +
+    geom_line(color = "#1D4ED8", linewidth = 0.8) + # Tailwind blue-700 for returns
+    labs(
+      title = "Cumulative Strategy Log Returns",
+      y = "Cumulative Log Return",
+      x = NULL
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0),
+      axis.title.y = element_text(margin = margin(r = 10)),
+      panel.grid.minor = element_blank()
+    )
+
+  # 3. Create Rolling Volatility Plot
+  vol_plot <- flow_strategy %>%
+    # Volatility is already annualized
+    ggplot(aes(x = date, y = volatility)) +
+    geom_line(color = "#B91C1C", linewidth = 0.8) + # Tailwind red-700 for risk
+    labs(
+      title = "Annualized Rolling Volatility",
+      y = "Annualized Volatility",
+      x = "Date"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0),
+      axis.title.y = element_text(margin = margin(r = 10)),
+      panel.grid.minor = element_blank()
+    )
+
+  # 4. Combine Plots using patchwork
+  combined_plot <- return_plot / vol_plot + 
+    plot_layout(heights = c(2, 1)) +
+    plot_annotation(
+      title = glue::glue("Strategy Performance: Cumulative Returns and Rolling Volatility"),
+      caption = glue::glue("Annualized volatility calculated over a {window}-day rolling window."),
+      theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+    )
+  
+  return(combined_plot)
+}
+
+
+
+#' Applies a no-trading buffer to a series of target weights.
+#'
+#' The final weight only changes if the initial weight deviates from the last
+#' transacted weight by more than the specified buffer percentage.
+#'
+#' @param df A dataframe containing columns 'date', 'ticker', and 'weight'.
+#' @param trade_buffer The percentage buffer (e.g., 0.01 for 1%).
+#'
+#' @return The input dataframe augmented with a 'weight_buffer_weight' column.
+mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
+
+  # Ensure the data is sorted by date within each ticker group for proper sequential processing
+  df_sorted <- df %>%
+    arrange(ticker, date)
+
+  # Initialize the final_weight column (will be filled sequentially)
+  df_sorted$weight_buffer_weight <- NA_real_
+
+  # Use group_split and map to process each ticker's series independently
+  # We use a loop structure within purrr::map to handle the sequential update logic.
+  df_output <- df_sorted %>%
+    group_by(ticker) %>%
+    group_modify(~ {
+
+      # Initialize tracking variable for the last weight that triggered a trade
+      last_transacted_weight <- NA_real_
+
+      # Process rows sequentially for the current ticker group
+      for (i in 1:nrow(.x)) {
+        # --- READING THE USER'S WEIGHT COLUMN ---
+        current_weight <- .x$weight[i]
+
+        # --- 1. First Day Logic (Always transacts) or Zero Weight ---
+        if (is.na(last_transacted_weight) || last_transacted_weight == 0) {
+
+          # The first valid weight becomes the starting transacted weight
+          .x$weight_buffer_weight[i] <- current_weight
+          last_transacted_weight <- current_weight
+
+        } else {
+
+          # --- 2. Buffer Check Logic ---
+
+          # Calculate the upper and lower bounds based on the last transacted weight
+          lower_bound <- last_transacted_weight * (1 - trade_buffer)
+          upper_bound <- last_transacted_weight * (1 + trade_buffer)
+
+          # Check if the current weight is OUTSIDE the buffer bounds
+          is_outside_buffer <- current_weight < lower_bound || current_weight > upper_bound
+
+          if (is_outside_buffer) {
+            # Weight is outside the buffer -> TRANSACTION OCCURS
+            .x$weight_buffer_weight[i] <- current_weight
+            # Update the last transacted weight for the next day's check
+            last_transacted_weight <- current_weight
+
+          } else {
+            # Weight is INSIDE the buffer -> NO TRANSACTION
+            # The final weight remains the previous transacted weight
+            .x$weight_buffer_weight[i] <- last_transacted_weight
+          }
+        }
+      }
+      # Return the modified group data frame
+      return(.x)
+    }) %>%
+    ungroup()
+
+  return(df_output)
 }

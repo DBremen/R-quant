@@ -597,18 +597,25 @@ mq_plot_return_vol <- function(flow_positions, window = 60, annual_factor = 252)
 }
 
 
-
-#' Applies a no-trading buffer to a series of target weights, and then scales the 
-#' final daily weights proportionally so that the sum of absolute weights across 
+#' @title Applies Trading Buffer and Portfolio Scaling
+#'
+#' @description
+#' Applies a no-trading buffer to a series of target weights, and then scales the
+#' final daily weights proportionally so that the sum of absolute weights across
 #' the entire portfolio does not exceed 1.0.
 #'
 #' The final weight only changes if the initial weight deviates from the last
-#' transacted weight by more than the specified buffer percentage.
+#' transacted weight by more than the specified buffer percentage (relative to
+#' the magnitude of the last transacted weight). This implementation is robust
+#' for long-only strategies and handles the initiation of positions from zero correctly.
 #'
 #' @param df A dataframe containing columns 'date', 'ticker', and 'weight'.
 #' @param trade_buffer The percentage buffer (e.g., 0.01 for 1%).
 #'
 #' @return The input dataframe augmented with the final scaled weight in the 'weight_buffer_weight' column.
+#'
+#' @importFrom dplyr arrange group_by group_modify ungroup mutate if_else
+#'
 mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
 
   # Ensure the data is sorted by date within each ticker group for proper sequential processing
@@ -630,23 +637,38 @@ mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
       for (i in 1:nrow(.x)) {
         current_weight <- .x$weight[i]
 
-        # --- 1. First Day Logic (Always transacts) or Zero Weight ---
-        if (is.na(last_transacted_weight) || last_transacted_weight == 0) {
-
+        # --- 1. First Day Logic (Always transacts) ---
+        if (is.na(last_transacted_weight)) {
           # The first valid weight becomes the starting transacted weight
           .x$weight_buffer_weight[i] <- current_weight
           last_transacted_weight <- current_weight
 
+        } else if (last_transacted_weight == 0) {
+          # --- 2a. Zero Position Logic (Must trade if target is non-zero) ---
+          # We use a small tolerance (1e-5) to initiate a trade only if the
+          # target weight is meaningfully different from zero.
+          if (abs(current_weight) > 1e-5) {
+             # Target is non-zero, so a new position is initiated
+             .x$weight_buffer_weight[i] <- current_weight
+             last_transacted_weight <- current_weight
+          } else {
+             # Target is still effectively zero, so no transaction
+             .x$weight_buffer_weight[i] <- 0
+             last_transacted_weight <- 0
+          }
+
         } else {
 
-          # --- 2. Buffer Check Logic ---
+          # --- 2b. Active Position Buffer Check Logic ---
 
-          # Calculate the upper and lower bounds based on the last transacted weight
-          lower_bound <- last_transacted_weight * (1 - trade_buffer)
-          upper_bound <- last_transacted_weight * (1 + trade_buffer)
+          # Calculate the required absolute difference to trigger a trade.
+          # This deviation is based on the magnitude of the last position held:
+          # Deviation = |Last Position| * Buffer Percentage
+          allowed_deviation <- abs(last_transacted_weight) * trade_buffer
 
-          # Check if the current weight is OUTSIDE the buffer bounds
-          is_outside_buffer <- current_weight < lower_bound || current_weight > upper_bound
+          # A trade occurs if the absolute difference between the current target and the last holding
+          # exceeds the allowed deviation.
+          is_outside_buffer <- abs(current_weight - last_transacted_weight) > allowed_deviation
 
           if (is_outside_buffer) {
             # Weight is outside the buffer -> TRANSACTION OCCURS
@@ -666,7 +688,7 @@ mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
     }) %>%
     dplyr::ungroup()
 
-  # --- STEP 2: Apply Portfolio-Wide Scaling by Date ---
+  # --- STEP 3: Apply Portfolio-Wide Scaling by Date ---
   # Ensures that the sum of absolute weights for the entire portfolio (all tickers)
   # does not exceed 1.0 on any given date.
   df_final_scaled <- df_output_buffer %>%
@@ -674,12 +696,12 @@ mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
     dplyr::mutate(
       # Calculate the sum of absolute final weights for the current day
       total_abs_weight = sum(abs(weight_buffer_weight), na.rm = TRUE),
-      
+
       # Apply proportional scaling: if total > 1, divide all weights by the total_abs_weight.
       # The result is stored back in 'weight_buffer_weight'.
       weight_buffer_weight = dplyr::if_else(
-        total_abs_weight > 1, 
-        weight_buffer_weight / total_abs_weight, 
+        total_abs_weight > 1,
+        weight_buffer_weight / total_abs_weight,
         weight_buffer_weight
       )
     ) %>%

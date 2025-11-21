@@ -650,3 +650,107 @@ mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
 
   return(df_output)
 }
+
+
+#' Downloads and processes the 13-week T-Bill interest rate, aligning it 
+#' perfectly with the dates present in the input portfolio data frame (port_df).
+#'
+#' @param port_df A tibble/data.frame containing a column named 'date' (as Date type).
+#' @return A matrix with two columns: date (numeric) and rate (numeric daily risk-free rate).
+mq_get_tbill_rate_matrix <- function(port_df) {
+  
+  # Check for 'date' column in the input data frame
+  if (!"date" %in% names(port_df)) {
+    stop("Input 'port_df' must contain a column named 'date'.")
+  }
+  
+  # 1. Determine the required date range from port_df
+  start_date <- as.character(min(port_df$date, na.rm = TRUE))
+  end_date <- as.character(max(port_df$date, na.rm = TRUE))
+
+  
+  # 2. Download T-Bill data (^IRX)
+  tryCatch({
+    # Download data covering the portfolio's date range
+    getSymbols("^IRX", auto.assign = TRUE)
+  }, error = function(e) {
+    stop(paste("Failed to download ^IRX data. Error:", e$message))
+  })
+  
+  # Ensure IRX object was created
+  if (!exists("IRX") || !is.xts(IRX)) {
+     stop("^IRX data could not be retrieved by quantmod::getSymbols.")
+  }
+
+  # 3. Process T-Bill data
+  rates_df <- mq_xts_to_tidy(IRX) %>%
+    dplyr::arrange(date) %>%
+    dplyr::select(date, close) %>%
+    # Ensure rate is numeric and handle any NA values by carrying the last observation forward
+    dplyr::mutate(
+      dplyr::across(.cols = close, .fns = as.numeric),
+      rate = close / (365 * 100) # Convert annual percentage to daily decimal rate
+    ) %>%
+    tidyr::fill(rate, .direction = "down") %>%
+    dplyr::select(date, rate)
+
+  # 4. Join rates data to port_df and finalize the matrix
+  risk_free_rate_matrix <- port_df %>%
+    # Select only the dates from the portfolio to use as the base for the join
+    dplyr::select(date) %>% 
+    # Left join to attach the calculated rate for each portfolio date
+    dplyr::left_join(rates_df, by = "date") %>%
+    # Fill any remaining NA rates (if a market day falls on a non-rate day)
+    tidyr::fill(rate, .direction = "down") %>%
+    # Handle the very first date if it was NA (rare, but prevents issues)
+    tidyr::fill(rate, .direction = "up") %>% 
+    
+    # Final step: select date and rate, and convert to matrix
+    # The 'date' column is converted to its underlying numeric value (days since epoch)
+    data.matrix() 
+  
+  return(risk_free_rate_matrix)
+}
+
+# R function to calculate Sharpe Ratio (assuming risk-free rate of zero)
+# and using log returns for volatility and mean return calculation.
+
+# This function requires the 'dplyr' and 'tidyr' packages.
+# library(dplyr)
+# library(tidyr)
+
+mq_get_backtest_sharpe <- function(backtest_results) {
+  
+  # Calculate the daily Net Asset Value (NAV) exposure
+  NAV <- backtest_results %>%
+    dplyr::group_by(date) %>%
+    dplyr::summarise(exposure = sum(exposure, na.rm = TRUE)) %>%
+    dplyr::mutate(ticker = "NAV")
+
+  # Combine NAV with the original data for processing (though only NAV is filtered next)
+  NAV_combined <- backtest_results %>%
+    dplyr::select(ticker, date, exposure) %>%
+    dplyr::bind_rows(NAV) %>%
+    dplyr::arrange(date, ticker)
+
+  # Calculate performance metrics
+  perf <- NAV_combined %>%
+    dplyr::filter(ticker == "NAV") %>%
+    dplyr::arrange(date) %>%
+    
+    # Calculate daily log returns
+    dplyr::mutate(returns = log(exposure/dplyr::lag(exposure))) %>%
+    stats::na.omit() %>%
+    
+    # Calculate annualized metrics (assuming 252 trading days)
+    dplyr::summarise(
+      `Ave.Ann.Return %` = round(100 * mean(returns, na.rm = TRUE) * 252, 2),
+      `Ann.Volatility %` = round(100 * stats::sd(returns, na.rm = TRUE) * sqrt(252), 2),
+      # Sharpe Ratio = Annual Return / Annual Volatility (assuming R_f = 0)
+      Sharpe = round(`Ave.Ann.Return %` / `Ann.Volatility %`, 2)
+    )
+
+    # Return the Sharpe Ratio value
+    perf %>% dplyr::pull(Sharpe)
+
+}

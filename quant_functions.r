@@ -790,3 +790,238 @@ mq_get_backtest_sharpe <- function(backtest_results) {
     perf %>% dplyr::pull(Sharpe)
 
 }
+
+#' Generates a combined plot showing Cash Exposure and total Portfolio Leverage 
+#' over time, based on buffered backtest results.
+#'
+#' This function requires the 'dplyr', 'ggplot2', and 'patchwork' packages.
+#'
+#' @param results_df A dataframe containing the final backtest results. 
+#'                   It must include columns: 'date', 'ticker', 'exposure', and 
+#'                   the column specified by 'weight_col_name'.
+#' @param weight_col_name A character string specifying the name of the column 
+#'                        in 'results_df' that holds the final portfolio weights 
+#'                        used for leverage calculation (e.g., 'weight_final' or 
+#'                        'weight_buffer_weight'). Defaults to 'weight_buffer_weight'.
+#'
+#' @return A 'patchwork' object combining the cash exposure and portfolio 
+#'         leverage plots.
+mq_backtest_cashexposure_leverage <- function(port_df,results_df, weight_col_name = "weight_buffer_weight") {
+  
+  # Check if the required weight column exists
+  if (!weight_col_name %in% names(port_df)) {
+    stop(paste0("Column '", weight_col_name, "' not found in results_df."))
+  }
+
+  # --- Plot 1: Negative Cash Exposure ---
+  # Filters for 'Cash' ticker and plots the 'exposure' column.
+  p1 <- results_df %>%
+    dplyr::group_by(date) %>%
+    dplyr::filter(ticker == 'Cash') %>%
+    ggplot2::ggplot(ggplot2::aes(x = date, y = exposure)) +
+    ggplot2::geom_line() +
+    # Highlight the zero exposure line
+    ggplot2::geom_hline(yintercept = 0, linetype = 'dashed', colour = "red") +
+    ggplot2::labs(y = "Negative cash exposure") +
+    # Zoom into a relevant y-range for clarity
+    ggplot2::coord_cartesian(ylim = c(-5000, 5000))
+
+  # --- Plot 2: Portfolio Leverage (Sum of Absolute Weights) ---
+  p2 <- port_df %>%
+    dplyr::group_by(date) %>%
+    # Sum the absolute final weights using the dynamically specified column name
+    dplyr::summarise(portfolio_leverage = sum(abs(.data[[weight_col_name]]))) %>%
+    ggplot2::ggplot(ggplot2::aes(x = date, y = portfolio_leverage)) +
+    ggplot2::geom_line() +
+    # Highlight the 1.0 leverage limit
+    ggplot2::geom_hline(yintercept = 1, linetype = 'dashed', colour = "blue") +
+    ggplot2::labs(y = paste("Portfolio leverage"))
+
+  # --- Combine Plots using patchwork ---
+  combined_plot <- p1 / p2 + 
+    patchwork::plot_annotation(title = "Cash Exposure and Combined Portfolio Leverage")
+
+  return(combined_plot)
+}
+
+#' Generates a ggplot2 area plot showing individual ticker dollar exposure 
+#' (including Cash) and overlays a line plot of the total Net Asset Value (NAV).
+#'
+#' This function dynamically handles any number of tickers present in the input 
+#' dataframe, assigning default colors automatically.
+#'
+#' This function requires the 'dplyr' and 'ggplot2' packages.
+#'
+#' @param results_df A dataframe containing the backtest results. 
+#'                   It must include columns: 'date', 'ticker', and 'exposure'.
+#'
+#' @return A ggplot2 object visualizing the exposures and NAV.
+mq_backtest_plot_NAV_ticker_exposure <- function(results_df) {
+  
+  # --- 1. Calculate NAV (Total Dollar Exposure) ---
+  NAV_data <- results_df %>%
+    dplyr::group_by(date) %>%
+    # Sum all dollar exposures for that date
+    dplyr::summarise(exposure = sum(exposure)) %>%
+    # Assign a unique identifier for the total NAV line
+    dplyr::mutate(ticker = "NAV")
+
+  # --- 2. Prepare combined data for plotting ---
+  plot_data <- results_df %>%
+    dplyr::select(ticker, date, exposure) %>%
+    # Combine individual ticker exposures with the total NAV data
+    dplyr::bind_rows(NAV_data) %>%
+    dplyr::arrange(date, ticker)
+
+  # --- 3. Generate the Plot ---
+  # The area plot uses fill to show individual exposures
+  p <- plot_data %>%
+    # Filter out the 'NAV' row for the area plot section
+    dplyr::filter(ticker != "NAV") %>%
+    ggplot2::ggplot(ggplot2::aes(x = date, y = exposure, fill = ticker)) +
+    
+    # Area plot for individual exposures. ggplot will automatically
+    # select a distinct color for every unique ticker in the 'fill' aesthetic.
+    ggplot2::geom_area() +
+    
+    # Overlay the NAV line plot
+    ggplot2::geom_line(
+      data = plot_data %>% dplyr::filter(ticker == "NAV"), 
+      # Note: We map the colour aesthetic to a constant string "NAV" to control 
+      # its appearance in the legend (separate from the fill legend).
+      ggplot2::aes(x = date, y = exposure, colour = "NAV"), 
+      linewidth = 1.5
+    ) +
+    
+    # Set the color for the NAV line and manage its legend appearance
+    ggplot2::scale_colour_manual(
+      values = c("NAV" = "black"), 
+      labels = "NAV",
+      name = "" # Hides the legend title for the NAV line
+    ) +
+    
+    # Set labels and title
+    ggplot2::labs(
+      x = "Date",
+      y = "Dollar Exposure",
+      title = "Ticker Dollar Exposure and Net Asset Value (NAV)",
+      # Rename the fill legend title
+      fill = "Ticker Exposure"
+    ) +
+    
+    # Apply a clean theme
+    ggplot2::theme_minimal() + 
+    ggplot2::theme(legend.title = ggplot2::element_text(face = "bold"))
+
+  return(p)
+}
+
+#' @title Get Context for All NA Values
+#'
+#' @description
+#' Identifies rows where *any* column (excluding 'date' and 'ticker') is NA
+#' and returns those rows along with the immediately preceding and succeeding
+#' rows for the same ticker. This is useful for comprehensive missing data review.
+#'
+#' @param df The data frame to search (expected to contain 'date' and 'ticker' columns).
+#'
+#' @return A data frame containing all rows that have an NA in any column
+#'         (other than 'date'/'ticker') and their immediate neighbors.
+#'
+mq_get_na_rows <- function(df) {
+
+  # 1. Basic checks
+  if (!("ticker" %in% names(df) && "date" %in% names(df))) {
+    stop("Data frame must contain both 'ticker' and 'date' columns.")
+  }
+
+  cols_to_check <- setdiff(names(df), c("date", "ticker"))
+
+  if (length(cols_to_check) == 0) {
+    warning("No numeric columns found to check for NA values (only 'date' and 'ticker' exist).")
+    return(df[0, ])
+  }
+
+  # 2. Calculate the NA flag for the full data frame (size nrow(df))
+  has_na <- apply(df[, cols_to_check, drop = FALSE], 1, function(row) any(is.na(row)))
+
+  # 3. Start pipeline, introducing the flag BEFORE grouping
+  df_context <- df %>%
+    # Add the calculated vector as a new column to the full dataframe
+    dplyr::mutate(has_na_flag = has_na) %>%
+
+    # Group by ticker to define the scope for context operations (lag/lead)
+    dplyr::group_by(ticker) %>%
+
+    # Determine context flag: Is it the NA row, the row before it, or the row after it?
+    dplyr::mutate(
+      context_flag = has_na_flag | dplyr::lag(has_na_flag, n = 1L) | dplyr::lead(has_na_flag, n = 1L)
+    ) %>%
+
+    # Filter and Cleanup
+    dplyr::filter(context_flag == TRUE) %>%
+    dplyr::select(-has_na_flag, -context_flag) %>%
+    dplyr::ungroup() %>%
+    dplyr::distinct() # Remove duplicate rows that might overlap (e.g., two NAs in a row)
+
+  return(df_context)
+}
+
+#' @title Update Close and Adjusted Prices
+#'
+#' @description
+#' Updates the 'close' and 'adjusted' price columns for a specific ticker and date
+#' in a data frame. Returns a list containing the complete updated data frame
+#' and the subset of updated rows for confirmation.
+#'
+#' @param df The data frame to be updated (e.g., 'prices').
+#' @param ticker A character string of the ticker to update (e.g., "PRAS.DE").
+#' @param date A date object or character string coercible to Date (e.g., "2025-10-24").
+#' @param new_price A numeric value for the new 'close' price.
+#' @param new_adjusted_price An optional numeric value for the new 'adjusted' price.
+#'        If NULL (default), 'new_price' is used for 'adjusted'.
+#'
+#' @return A list with two elements:
+#'         $df_updated: The complete data frame after modification.
+#'         $rows_confirmed: A data frame containing only the rows that were updated.
+mq_update_price <- function(df, ticker, date, new_price, new_adjusted_price = NULL) {
+
+  # Determine the adjusted price to use
+  adj_price <- if (is.null(new_adjusted_price)) {
+    new_price
+  } else {
+    new_adjusted_price
+  }
+
+  # Coerce date input to Date object for robust comparison
+  target_date <- tryCatch(
+    as.Date(date),
+    error = function(e) stop("Invalid date format provided.")
+  )
+
+  # 1. Define the logical condition to identify the row(s)
+  condition <- (df$date == target_date) & (df$ticker == ticker)
+
+  # Check if any row matches the condition
+  if (sum(condition) == 0) {
+    warning(paste0("No rows matched the criteria: Ticker='", ticker, "', Date='", date, "'"))
+    # Return the original DF and an empty confirmation DF
+    return(list(
+      df_updated = df,
+      rows_confirmed = df[0, ]
+    ))
+  }
+
+  # 2. Perform the update on the target columns
+  df$close[condition] <- new_price
+  df$adjusted[condition] <- adj_price
+
+  # 3. Capture the updated rows *before* returning
+  updated_rows <- df[condition, ]
+
+  # 4. Return the complete updated DF and the confirmation rows in a list
+  return(list(
+    df_updated = df,
+    rows_confirmed = updated_rows
+  ))
+}

@@ -6,14 +6,13 @@ library(knitr)
 library(scales)
 
 
-#' @title Applies Adaptive Trading Buffer (Corrected Order)
+#' @title Applies Adaptive Trading Buffer with Final Portfolio Scaling
 #'
 #' @description
 #' Calculates the permissible target weights by first scaling them to meet
-#' portfolio constraints (sum of absolute weights <= 1.0), and then applying
-#' a no-trade buffer based on lagged volatility to that scaled target.
-#'
-#' This order ensures the buffer is applied to the final, actionable target weight.
+#' portfolio constraints (sum of absolute weights <= 1.0), applying the
+#' adaptive buffer, and finally re-scaling the result to guarantee total
+#' exposure does not exceed 1.0.
 #'
 #' @param df A dataframe containing columns 'date', 'ticker', 'weight' (target),
 #'           and 'lag_volatility' (annualized 60-day volatility in decimal form).
@@ -27,24 +26,19 @@ library(scales)
 #'
 mq_apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
 
-  # Ensure the data is sorted by date within each ticker group for proper sequential processing
+  # 0. Initial Setup and Buffer Calculation
   df_sorted <- df %>%
     dplyr::arrange(ticker, date) %>%
-    # Calculate the asset-specific, ABSOLUTE buffer size for each row
     dplyr::mutate(
       effective_buffer = lag_volatility * vol_multiplier
     )
 
-  # --- STEP 1: APPLY PORTFOLIO-WIDE SCALING (Normalization) ---
-  # This step forces the theoretical target weights to respect the portfolio constraint (sum(|W|) <= 1).
+  # --- STEP 1: SCALE TARGETS (Normalization) ---
+  # Determines the max permissible target weight for the day.
   df_scaled_targets <- df_sorted %>%
     dplyr::group_by(date) %>%
     dplyr::mutate(
-      # Calculate the sum of absolute raw weights for the current day
       total_abs_weight_raw = sum(abs(weight), na.rm = TRUE),
-
-      # Apply proportional scaling: if total > 1, divide all weights by the total_abs_weight_raw.
-      # This is the "true" target weight the manager can afford to hold.
       weight_scaled = dplyr::if_else(
         total_abs_weight_raw > 1,
         weight / total_abs_weight_raw,
@@ -53,39 +47,32 @@ mq_apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
     ) %>%
     dplyr::ungroup()
 
-  # --- STEP 2: Apply Ticker-Specific Adaptive Buffer Logic to the SCALED Targets ---
-  # Initialize the final weight column (will be filled sequentially)
+  # Initialize the final weight column (to be filled sequentially)
   df_scaled_targets$weight_buffer_vol <- NA_real_
 
+  # --- STEP 2: APPLY ADAPTIVE BUFFER LOGIC ---
+  # Decides whether to trade to 'weight_scaled' or hold 'last_transacted_weight'.
+  # This step can result in total exposure > 1.0 temporarily.
   df_output_buffer <- df_scaled_targets %>%
     dplyr::group_by(ticker) %>%
     dplyr::group_modify(~ {
 
-      # Initialize tracking variable for the last weight that triggered a trade
       last_transacted_weight <- NA_real_
 
-      # Process rows sequentially for the current ticker group
       for (i in 1:nrow(.x)) {
-        # *** IMPORTANT: Use the SCALED weight for the current target ***
         current_weight <- .x$weight_scaled[i]
         trade_buffer <- .x$effective_buffer[i]
 
-        # 1. First Day Logic (Always transacts)
         if (is.na(last_transacted_weight)) {
           .x$weight_buffer_vol[i] <- current_weight
           last_transacted_weight <- current_weight
 
         } else {
-
-          # 2. Absolute Buffer Check Logic
           weight_drift_abs <- abs(current_weight - last_transacted_weight)
-
-          # Handle NA trade_buffer by forcing a trade (TRUE)
-          # Trade is triggered if drift is > effective_buffer
           is_outside_buffer <- is.na(trade_buffer) | (weight_drift_abs > trade_buffer)
 
           if (is_outside_buffer) {
-            # Transaction occurs: Update to the current SCALED target weight
+            # Trade occurs: Update to the current SCALED target weight
             .x$weight_buffer_vol[i] <- current_weight
             last_transacted_weight <- current_weight
 
@@ -97,11 +84,29 @@ mq_apply_adaptive_trading_buffer <- function(df, vol_multiplier = 2.0) {
       }
       return(.x)
     }) %>%
-    dplyr::ungroup() %>%
-    # --- STEP 3: Final Selection (Remove intermediate columns) ---
-    dplyr::select(-total_abs_weight_raw, -weight_scaled)
+    dplyr::ungroup()
 
-  return(df_output_buffer)
+
+  # --- STEP 3: FINAL SCALE (SAFETY NET) ---
+  # Ensures that the sum of the buffered weights is not > 1.0.
+  df_final_scaled <- df_output_buffer %>%
+    dplyr::group_by(date) %>%
+    dplyr::mutate(
+      # Calculate the sum of absolute buffered/held weights
+      total_abs_weight_final = sum(abs(weight_buffer_vol), na.rm = TRUE),
+
+      # Apply final proportional scaling if the sum exceeds 1.0
+      weight_buffer_vol = dplyr::if_else(
+          total_abs_weight_final > 1,
+          weight_buffer_vol / total_abs_weight_final,
+          weight_buffer_vol
+      )
+    ) %>%
+    dplyr::ungroup() %>%
+    # --- STEP 4: Final Selection (Remove intermediate columns) ---
+    dplyr::select(-total_abs_weight_raw, -weight_scaled, -total_abs_weight_final)
+
+  return(df_final_scaled)
 }
 
 
@@ -605,15 +610,13 @@ mq_plot_return_vol <- function(flow_positions, window = 60, annual_factor = 252)
 }
 
 
-#' @title Applies Trading Buffer and Portfolio Scaling (Corrected Order)
+#' @title Applies Proportional Trading Buffer and Portfolio Scaling (Final Corrected Order)
 #'
 #' @description
 #' Calculates the permissible target weights by first scaling them to meet
-#' portfolio constraints (sum of absolute weights <= 1.0), and then applying
-#' a no-trade buffer to that scaled target.
-#'
-#' This order ensures the buffer is applied to the final, actionable target weight,
-#' correcting the over-trading issue.
+#' portfolio constraints (sum of absolute weights <= 1.0), applying the
+#' proportional buffer, and finally re-scaling the result to guarantee total
+#' exposure does not exceed 1.0.
 #'
 #' @param df A dataframe containing columns 'date', 'ticker', and 'weight'.
 #' @param trade_buffer The percentage buffer (e.g., 0.01 for 1%).
@@ -629,15 +632,12 @@ mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
   df_sorted <- df %>%
     dplyr::arrange(ticker, date)
 
-  # --- STEP 1: APPLY PORTFOLIO-WIDE SCALING (Normalization) ---
-  # This step determines the "true" target weight by forcing sum(|W|) <= 1.
+  # --- STEP 1: SCALE TARGETS (Normalization) ---
+  # Determines the max permissible target weight for the day (Sum(|W_scaled|) <= 1.0).
   df_scaled_targets <- df_sorted %>%
     dplyr::group_by(date) %>%
     dplyr::mutate(
-      # Calculate the sum of absolute raw weights for the current day
       total_abs_weight_raw = sum(abs(weight), na.rm = TRUE),
-
-      # Apply proportional scaling: if total > 1, divide all weights by the total_abs_weight_raw.
       weight_scaled = dplyr::if_else(
         total_abs_weight_raw > 1,
         weight / total_abs_weight_raw,
@@ -646,43 +646,39 @@ mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
     ) %>%
     dplyr::ungroup()
 
-  # --- STEP 2: Apply Ticker-Specific Buffer Logic to the SCALED Targets ---
+  # Initialize the final weight column (to be filled sequentially)
+  df_scaled_targets$weight_buffer_weight <- NA_real_
+
+  # --- STEP 2: APPLY PROPORTIONAL BUFFER LOGIC ---
+  # Decides whether to trade to 'weight_scaled' or hold 'last_transacted_weight'.
+  # This step can result in total exposure > 1.0 temporarily.
   df_output_buffer <- df_scaled_targets %>%
     dplyr::group_by(ticker) %>%
     dplyr::group_modify(~ {
 
-      # Initialize tracking variable for the last weight that triggered a trade
       last_transacted_weight <- NA_real_
 
-      # Process rows sequentially for the current ticker group
       for (i in 1:nrow(.x)) {
-        # *** IMPORTANT: Use the SCALED weight for the current target ***
         current_weight <- .x$weight_scaled[i]
 
-        # --- 1. First Day Logic (Always transacts) ---
         if (is.na(last_transacted_weight)) {
+          # First day always trades
           .x$weight_buffer_weight[i] <- current_weight
           last_transacted_weight <- current_weight
 
         } else if (last_transacted_weight == 0) {
-          # --- 2a. Zero Position Logic (Initiation) ---
-          if (abs(current_weight) > 1e-5) {
-             # Target is non-zero, initiate position
+          # Special case: If last weight was zero, only trade if the new weight is significant
+          if (abs(current_weight) > 1e-5) { # Use a small tolerance for zero check
              .x$weight_buffer_weight[i] <- current_weight
              last_transacted_weight <- current_weight
           } else {
-             # Target is still effectively zero
              .x$weight_buffer_weight[i] <- 0
              last_transacted_weight <- 0
           }
 
         } else {
-
-          # --- 2b. Active Position Buffer Check Logic ---
-          # Deviation = |Last Position| * Buffer Percentage
+          # Standard proportional buffer check
           allowed_deviation <- abs(last_transacted_weight) * trade_buffer
-
-          # Check if the SCALED target deviates too much from the LAST held weight
           is_outside_buffer <- abs(current_weight - last_transacted_weight) > allowed_deviation
 
           if (is_outside_buffer) {
@@ -696,16 +692,31 @@ mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
           }
         }
       }
-      # Return the modified group data frame
       return(.x)
     }) %>%
+    dplyr::ungroup()
+
+
+  # --- STEP 3: FINAL SCALE (SAFETY NET) ---
+  # Ensures that the sum of the buffered weights is not > 1.0 (no leverage).
+  df_final_scaled <- df_output_buffer %>%
+    dplyr::group_by(date) %>%
+    dplyr::mutate(
+      # Calculate the sum of absolute buffered/held weights
+      total_abs_weight_final = sum(abs(weight_buffer_weight), na.rm = TRUE),
+
+      # Apply final proportional scaling if the sum exceeds 1.0
+      weight_buffer_weight = dplyr::if_else(
+          total_abs_weight_final > 1,
+          weight_buffer_weight / total_abs_weight_final,
+          weight_buffer_weight
+      )
+    ) %>%
     dplyr::ungroup() %>%
-    # --- STEP 3: Final Selection (Remove intermediate columns) ---
-    # Only keep the final result and original columns
-    dplyr::select(-total_abs_weight_raw, -weight_scaled)
+    # --- STEP 4: Final Selection (Remove intermediate columns) ---
+    dplyr::select(-total_abs_weight_raw, -weight_scaled, -total_abs_weight_final)
 
-
-  return(df_output_buffer)
+  return(df_final_scaled)
 }
 
 #' Downloads and processes the 13-week T-Bill interest rate, aligning it 

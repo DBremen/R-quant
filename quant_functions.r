@@ -609,114 +609,105 @@ mq_plot_return_vol <- function(flow_positions, window = 60, annual_factor = 252)
   return(combined_plot)
 }
 
-
-#' @title Applies Proportional Trading Buffer and Portfolio Scaling (Final Corrected Order)
+#' @title Applies Absolute Trading Buffer and Portfolio Scaling
 #'
 #' @description
 #' Calculates the permissible target weights by first scaling them to meet
-#' portfolio constraints (sum of absolute weights <= 1.0), applying the
-#' proportional buffer, and finally re-scaling the result to guarantee total
+#' portfolio constraints (sum of absolute weights <= 1.0), applying an
+#' ABSOLUTE trade buffer, and finally re-scaling the result to guarantee total
 #' exposure does not exceed 1.0.
 #'
+#' This logic prevents over-trading small positions, which is common with
+#' proportional buffers.
+#'
 #' @param df A dataframe containing columns 'date', 'ticker', and 'weight'.
-#' @param trade_buffer The percentage buffer (e.g., 0.01 for 1%).
+#' @param trade_buffer The ABSOLUTE deviation buffer (e.g., 0.05 for 5 percentage points).
 #'
 #' @return The input dataframe augmented with the final scaled and buffered weight
-#'         in the 'weight_buffer_weight' column.
+#'     in the 'weight_buffer_weight' column.
 #'
 #' @importFrom dplyr arrange group_by group_modify ungroup mutate if_else select
-#'
 mq_apply_trading_buffer_weight <- function(df, trade_buffer) {
 
-  # Ensure the data is sorted by date within each ticker group for proper sequential processing
-  df_sorted <- df %>%
-    dplyr::arrange(ticker, date)
+ # Ensure the data is sorted by date within each ticker group
+ df_sorted <- df %>%
+  dplyr::arrange(ticker, date)
 
-  # --- STEP 1: SCALE TARGETS (Normalization) ---
-  # Determines the max permissible target weight for the day (Sum(|W_scaled|) <= 1.0).
-  df_scaled_targets <- df_sorted %>%
-    dplyr::group_by(date) %>%
-    dplyr::mutate(
-      total_abs_weight_raw = sum(abs(weight), na.rm = TRUE),
-      weight_scaled = dplyr::if_else(
-        total_abs_weight_raw > 1,
-        weight / total_abs_weight_raw,
-        weight
-      )
-    ) %>%
-    dplyr::ungroup()
+ # --- STEP 1: SCALE TARGETS (Normalization) ---
+ # Ensures the raw target weights (W_target) do not exceed 1.0 exposure.
+ df_scaled_targets <- df_sorted %>%
+  dplyr::group_by(date) %>%
+  dplyr::mutate(
+   total_abs_weight_raw = sum(abs(weight), na.rm = TRUE),
+   weight_scaled = dplyr::if_else(
+    total_abs_weight_raw > 1,
+    weight / total_abs_weight_raw,
+    weight
+   )
+  ) %>%
+  dplyr::ungroup()
 
-  # Initialize the final weight column (to be filled sequentially)
-  df_scaled_targets$weight_buffer_weight <- NA_real_
+ # Initialize the final weight column (to be filled sequentially)
+ df_scaled_targets$weight_buffer_weight <- NA_real_
 
-  # --- STEP 2: APPLY PROPORTIONAL BUFFER LOGIC ---
-  # Decides whether to trade to 'weight_scaled' or hold 'last_transacted_weight'.
-  # This step can result in total exposure > 1.0 temporarily.
-  df_output_buffer <- df_scaled_targets %>%
-    dplyr::group_by(ticker) %>%
-    dplyr::group_modify(~ {
+ # --- STEP 2: APPLY ABSOLUTE BUFFER LOGIC (The Change) ---
+ # Decides whether to trade to 'weight_scaled' or hold 'last_transacted_weight'.
+ df_output_buffer <- df_scaled_targets %>%
+  dplyr::group_by(ticker) %>%
+  dplyr::group_modify(~ {
 
-      last_transacted_weight <- NA_real_
+   last_transacted_weight <- NA_real_
 
-      for (i in 1:nrow(.x)) {
-        current_weight <- .x$weight_scaled[i]
+   for (i in 1:nrow(.x)) {
+    current_weight <- .x$weight_scaled[i]
 
-        if (is.na(last_transacted_weight)) {
-          # First day always trades
-          .x$weight_buffer_weight[i] <- current_weight
-          last_transacted_weight <- current_weight
+    if (is.na(last_transacted_weight)) {
+     # Day 1 always trades
+     .x$weight_buffer_weight[i] <- current_weight
+     last_transacted_weight <- current_weight
 
-        } else if (last_transacted_weight == 0) {
-          # Special case: If last weight was zero, only trade if the new weight is significant
-          if (abs(current_weight) > 1e-5) { # Use a small tolerance for zero check
-             .x$weight_buffer_weight[i] <- current_weight
-             last_transacted_weight <- current_weight
-          } else {
-             .x$weight_buffer_weight[i] <- 0
-             last_transacted_weight <- 0
-          }
+    } else {
+     
+     # *** ABSOLUTE BUFFER CHECK ***
+     # A trade is only triggered if the absolute difference is greater than the buffer value.
+     is_outside_buffer <- abs(current_weight - last_transacted_weight) > trade_buffer
 
-        } else {
-          # Standard proportional buffer check
-          allowed_deviation <- abs(last_transacted_weight) * trade_buffer
-          is_outside_buffer <- abs(current_weight - last_transacted_weight) > allowed_deviation
+     if (is_outside_buffer) {
+      # Trade occurs: Update to the current SCALED target weight
+      .x$weight_buffer_weight[i] <- current_weight
+      last_transacted_weight <- current_weight
 
-          if (is_outside_buffer) {
-            # Trade occurs: Update to the current SCALED target weight
-            .x$weight_buffer_weight[i] <- current_weight
-            last_transacted_weight <- current_weight
-
-          } else {
-            # No Trade: Hold the previous transacted weight
-            .x$weight_buffer_weight[i] <- last_transacted_weight
-          }
-        }
-      }
-      return(.x)
-    }) %>%
-    dplyr::ungroup()
+     } else {
+      # No Trade: Hold the previous transacted weight
+      .x$weight_buffer_weight[i] <- last_transacted_weight
+     }
+    }
+   }
+   return(.x)
+  }) %>%
+  dplyr::ungroup()
 
 
-  # --- STEP 3: FINAL SCALE (SAFETY NET) ---
-  # Ensures that the sum of the buffered weights is not > 1.0 (no leverage).
-  df_final_scaled <- df_output_buffer %>%
-    dplyr::group_by(date) %>%
-    dplyr::mutate(
-      # Calculate the sum of absolute buffered/held weights
-      total_abs_weight_final = sum(abs(weight_buffer_weight), na.rm = TRUE),
+ # --- STEP 3: FINAL SCALE (SAFETY NET) ---
+ # Ensures that the sum of the buffered weights is not > 1.0 (no leverage).
+ df_final_scaled <- df_output_buffer %>%
+  dplyr::group_by(date) %>%
+  dplyr::mutate(
+   # Calculate the sum of absolute buffered/held weights
+   total_abs_weight_final = sum(abs(weight_buffer_weight), na.rm = TRUE),
 
-      # Apply final proportional scaling if the sum exceeds 1.0
-      weight_buffer_weight = dplyr::if_else(
-          total_abs_weight_final > 1,
-          weight_buffer_weight / total_abs_weight_final,
-          weight_buffer_weight
-      )
-    ) %>%
-    dplyr::ungroup() %>%
-    # --- STEP 4: Final Selection (Remove intermediate columns) ---
-    dplyr::select(-total_abs_weight_raw, -weight_scaled, -total_abs_weight_final)
+   # Apply final proportional scaling if the sum exceeds 1.0
+   weight_buffer_weight = dplyr::if_else(
+     total_abs_weight_final > 1 + 1e-9, # Using a small tolerance
+     weight_buffer_weight / total_abs_weight_final,
+     weight_buffer_weight
+   )
+  ) %>%
+  dplyr::ungroup() %>%
+  # --- STEP 4: Final Selection (Remove intermediate columns) ---
+  dplyr::select(-total_abs_weight_raw, -weight_scaled, -total_abs_weight_final)
 
-  return(df_final_scaled)
+ return(df_final_scaled)
 }
 
 #' Downloads and processes the 13-week T-Bill interest rate, aligning it 
@@ -837,7 +828,7 @@ mq_get_backtest_sharpe <- function(backtest_results) {
 #'
 #' @return A 'patchwork' object combining the cash exposure and portfolio 
 #'         leverage plots.
-mq_backtest_cashexposure_leverage <- function(port_df,results_df, weight_col_name = "weight_buffer_weight") {
+mq_backtest_cashexposure_leverage <- function(port_df,results_df, weight_col_name = "weight_buffer_weight",strategy_name="") {
   
   # Check if the required weight column exists
   if (!weight_col_name %in% names(port_df)) {
@@ -868,9 +859,10 @@ mq_backtest_cashexposure_leverage <- function(port_df,results_df, weight_col_nam
     ggplot2::geom_hline(yintercept = 1, linetype = 'dashed', colour = "blue") +
     ggplot2::labs(y = paste("Portfolio leverage"))
 
+  txt <- glue("Cash Exp. and Combined Portfolio Lvg. {strategy_name}")
   # --- Combine Plots using patchwork ---
   combined_plot <- p1 / p2 + 
-    patchwork::plot_annotation(title = "Cash Exposure and Combined Portfolio Leverage")
+    patchwork::plot_annotation(title = txt)
 
   return(combined_plot)
 }
@@ -887,7 +879,7 @@ mq_backtest_cashexposure_leverage <- function(port_df,results_df, weight_col_nam
 #'                   It must include columns: 'date', 'ticker', and 'exposure'.
 #'
 #' @return A ggplot2 object visualizing the exposures and NAV.
-mq_backtest_plot_NAV_ticker_exposure <- function(results_df) {
+mq_backtest_plot_NAV_ticker_exposure <- function(results_df, strategy_name = "") {
   
   # --- 1. Calculate NAV (Total Dollar Exposure) ---
   NAV_data <- results_df %>%
@@ -931,11 +923,12 @@ mq_backtest_plot_NAV_ticker_exposure <- function(results_df) {
       name = "" # Hides the legend title for the NAV line
     ) +
     
+    txt <- glue("Ticker Dollar Exposure and Net Asset Value (NAV) {strategy_name}")
     # Set labels and title
     ggplot2::labs(
       x = "Date",
       y = "Dollar Exposure",
-      title = "Ticker Dollar Exposure and Net Asset Value (NAV)",
+      title = txt,
       # Rename the fill legend title
       fill = "Ticker Exposure"
     ) +
@@ -1069,7 +1062,7 @@ mq_update_price <- function(df, ticker, date, new_price, new_adjusted_price = NU
 #'
 #' @return A ggplot object (a percentage stacked bar chart).
 
-mq_backtest_percentage_exposure <- function(df) {
+mq_backtest_percentage_exposure <- function(df, strategy_name = "") {
 
   # Ensure required packages are available
   if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
@@ -1105,7 +1098,8 @@ mq_backtest_percentage_exposure <- function(df) {
 
 
   # --- Plotting the Percentage Stacked Bar Chart ---
-
+  
+  txt <- glue("Proportion relative:total absolute daily exposure (sum of |exposure|) {strategy_name}")
   plot_output <- exposure_percentage_df %>%
     ggplot2::ggplot(ggplot2::aes(x = date, y = proportion_exposure, fill = ticker)) +
     ggplot2::geom_bar(stat = "identity", position = "fill") + # Position = "fill" normalizes bars to 100%
@@ -1115,7 +1109,7 @@ mq_backtest_percentage_exposure <- function(df) {
       x = "Date",
       y = "Percentage Exposure",
       title = "Daily Percentage Exposure by Ticker",
-      caption = "Proportion calculated relative to total absolute daily exposure (sum of |exposure|)."
+      caption = txt
     ) +
     # Add a clean, minimal theme
     ggplot2::theme_minimal() +
@@ -1138,7 +1132,7 @@ mq_backtest_percentage_exposure <- function(df) {
 #'                   Must include columns: 'ticker', 'date', 'exposure', 'share_trades', and 'commission'.
 #'
 #' @return A formatted tibble summarizing the metrics per ticker.
-mq_backtest_ticker_stats <- function(results_df) {
+mq_backtest_ticker_stats <- function(results_df, strategy_name = "") {
 
   # --- 0. Data Preparation: Calculate Returns from Exposure ---
   # Group by ticker and calculate the daily dollar return.
@@ -1202,7 +1196,8 @@ mq_backtest_ticker_stats <- function(results_df) {
     )
 
   # 4. Print the result using kable
-  cat("## Ticker-Specific Trade & Commission Summary\n\n")
+  txt <- glue("## Ticker-Specific Trade & Commission Summary. {strategy_name}\n\n")
+  cat(txt)
 
   print(knitr::kable(
     formatted_output,
@@ -1232,7 +1227,7 @@ mq_backtest_ticker_stats <- function(results_df) {
 #' @importFrom PerformanceAnalytics table.AnnualizedReturns table.Drawdowns table.Stats VaR CalmarRatio
 #' @importFrom tidyr drop_na pivot_wider
 #'
-mq_backtest_summarystats <- function(df) {
+mq_backtest_summarystats <- function(df, strategy_name = "") {
 
   # --- 1. Package and Column Validation ---
   if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
@@ -1342,6 +1337,7 @@ mq_backtest_summarystats <- function(df) {
   # D. Perform calculations using safe names and create final display columns
   final_stats <- raw_stats %>%
     dplyr::mutate(
+      Strategy = strategy_name,
       # Temporary column for drawdown calculation: use absolute value of depth for standard reporting
       Max_Drawdown_Value = abs(max_drawdown_value),
 
@@ -1358,6 +1354,7 @@ mq_backtest_summarystats <- function(df) {
     ) %>%
     # Select and reorder the final display columns, dropping all raw/temporary columns
     dplyr::select(
+      Strategy,
       `Annualized Return`,
       `Annual Volatility`,
       `Sharpe Ratio`,
@@ -1388,7 +1385,7 @@ mq_backtest_summarystats <- function(df) {
 #' @importFrom roll roll_sd
 #' @importFrom ggplot2 ggplot aes geom_line labs
 #'
-mq_backtest_rolling_portfolioVol <- function(df) {
+mq_backtest_rolling_portfolioVol <- function(df, strategy_name = "") {
 
   # --- 1. Validation and Setup ---
   if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
@@ -1431,12 +1428,12 @@ mq_backtest_rolling_portfolioVol <- function(df) {
 
 
   # --- 4. Generate Plot ---
-
+  txt <- glue("Rolling 60-day Annualized Portfolio Volatility {strategy_name}")
   portfolio_vol_plot <- port_vol_data %>%
     ggplot2::ggplot(ggplot2::aes(x = date, y = `Rolling Ann.Volatility`)) +
     ggplot2::geom_line(color = "#1f77b4", linewidth = 1) +
     ggplot2::labs(
-      title = "Rolling 60-day Annualized Portfolio Volatility",
+      title = txt,
       x = "Date",
       y = "Annualized Volatility (Std. Dev.)"
     ) +
@@ -1473,7 +1470,7 @@ mq_backtest_rolling_portfolioVol <- function(df) {
 #' @importFrom scales label_percent
 #' @importFrom stats na.omit
 #'
-mq_backtest_rolling_portfolioPerformance <- function(df) {
+mq_backtest_rolling_portfolioPerformance <- function(df, strategy_name = "") {
 
   # --- 0. Setup and Validation ---
   if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
@@ -1602,7 +1599,7 @@ mq_backtest_rolling_portfolioPerformance <- function(df) {
     # Apply scales::percent globally to format ratios (returns, drawdown, volatility)
     ggplot2::scale_y_continuous(labels = scales::label_percent(accuracy = 0.1)) +
     ggplot2::scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
-
+    txt <- glue("Performance Analysis of Portfolio (12-M rolling) {strategy_name}")
     ggplot2::labs(
       title = "Time-Series Performance Analysis of Portfolio (12-Month Rolling)",
       x = NULL,
@@ -1641,7 +1638,7 @@ mq_backtest_rolling_portfolioPerformance <- function(df) {
 #' @importFrom stats sd na.omit
 #' @importFrom knitr kable
 #'
-mq_backtest_annual_performance <- function(df) {
+mq_backtest_annual_performance <- function(df,strategy_name = "") {
 
   # --- 0. Setup and Validation ---
   if (!requireNamespace("dplyr", quietly = TRUE)) stop("Package 'dplyr' is required.")
@@ -1738,7 +1735,8 @@ mq_backtest_annual_performance <- function(df) {
     )
 
   # Print the formatted table using kable for a clean markdown output
-  cat("## Annual Performance Summary Table\n\n")
+  txt <- glue("## Annual Performance Summary Table {strategy_name}\n\n")
+  cat(txt)
   print(knitr::kable(formatted_summary,
                       caption = "Key Performance Metrics Aggregated by Calendar Year",
                       align = c('l', 'r', 'r', 'r', 'r')))

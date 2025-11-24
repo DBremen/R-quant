@@ -898,6 +898,7 @@ mq_backtest_plot_NAV_ticker_exposure <- function(results_df, strategy_name = "")
 
   # --- 3. Generate the Plot ---
   # The area plot uses fill to show individual exposures
+  txt <- glue("Ticker Dollar Exposure and Net Asset Value (NAV) {strategy_name}")
   p <- plot_data %>%
     # Filter out the 'NAV' row for the area plot section
     dplyr::filter(ticker != "NAV") %>%
@@ -923,7 +924,7 @@ mq_backtest_plot_NAV_ticker_exposure <- function(results_df, strategy_name = "")
       name = "" # Hides the legend title for the NAV line
     ) +
     
-    txt <- glue("Ticker Dollar Exposure and Net Asset Value (NAV) {strategy_name}")
+    
     # Set labels and title
     ggplot2::labs(
       x = "Date",
@@ -1569,7 +1570,7 @@ mq_backtest_rolling_portfolioPerformance <- function(df, strategy_name = "") {
   metric_order <- names(metric_labels)
 
   # --- 5. GENERATE COMBINED PERFORMANCE PLOT ---
-
+  txt <- glue("Performance Analysis of Portfolio (12-M rolling) {strategy_name}")
   performance_plot <- ggplot2::ggplot(combined_data, ggplot2::aes(x = date, y = Value)) +
 
     # Add Bar Chart for Monthly Returns
@@ -1599,9 +1600,8 @@ mq_backtest_rolling_portfolioPerformance <- function(df, strategy_name = "") {
     # Apply scales::percent globally to format ratios (returns, drawdown, volatility)
     ggplot2::scale_y_continuous(labels = scales::label_percent(accuracy = 0.1)) +
     ggplot2::scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
-    txt <- glue("Performance Analysis of Portfolio (12-M rolling) {strategy_name}")
     ggplot2::labs(
-      title = "Time-Series Performance Analysis of Portfolio (12-Month Rolling)",
+      title = txt,
       x = NULL,
       y = "Value"
     ) +
@@ -1736,7 +1736,7 @@ mq_backtest_annual_performance <- function(df,strategy_name = "") {
 
   # Print the formatted table using kable for a clean markdown output
   txt <- glue("## Annual Performance Summary Table {strategy_name}\n\n")
-  cat(txt)
+  cat("## Annual Performance Summary Table\n\n")
   print(knitr::kable(formatted_summary,
                       caption = "Key Performance Metrics Aggregated by Calendar Year",
                       align = c('l', 'r', 'r', 'r', 'r')))

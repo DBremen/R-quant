@@ -1100,7 +1100,8 @@ mq_backtest_percentage_exposure <- function(df, strategy_name = "") {
 
   # --- Plotting the Percentage Stacked Bar Chart ---
   
-  txt <- glue("Proportion relative:total absolute daily exposure (sum of |exposure|) {strategy_name}")
+  txt <- glue("Proportion relative:total absolute daily exposure (sum of |exposure|)")
+  txt2 <- glue("Daily Percentage Exposure by Ticker{strategy_name}")
   plot_output <- exposure_percentage_df %>%
     ggplot2::ggplot(ggplot2::aes(x = date, y = proportion_exposure, fill = ticker)) +
     ggplot2::geom_bar(stat = "identity", position = "fill") + # Position = "fill" normalizes bars to 100%
@@ -1109,7 +1110,7 @@ mq_backtest_percentage_exposure <- function(df, strategy_name = "") {
     ggplot2::labs(
       x = "Date",
       y = "Percentage Exposure",
-      title = "Daily Percentage Exposure by Ticker",
+      title = txt2,
       caption = txt
     ) +
     # Add a clean, minimal theme
@@ -1197,7 +1198,7 @@ mq_backtest_ticker_stats <- function(results_df, strategy_name = "") {
     )
 
   # 4. Print the result using kable
-  txt <- glue("## Ticker-Specific Trade & Commission Summary. {strategy_name}\n\n")
+  txt <- glue("\n\n## Ticker-Specific Trade & Commission Summary. {strategy_name}\n\n")
   cat(txt)
 
   print(knitr::kable(
@@ -1736,7 +1737,7 @@ mq_backtest_annual_performance <- function(df,strategy_name = "") {
 
   # Print the formatted table using kable for a clean markdown output
   txt <- glue("## Annual Performance Summary Table {strategy_name}\n\n")
-  cat("## Annual Performance Summary Table\n\n")
+  cat(txt)
   print(knitr::kable(formatted_summary,
                       caption = "Key Performance Metrics Aggregated by Calendar Year",
                       align = c('l', 'r', 'r', 'r', 'r')))
